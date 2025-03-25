@@ -1,0 +1,3 @@
+table:users
+column:id:int:primary_key
+column:name:string:50
