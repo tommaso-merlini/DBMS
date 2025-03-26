@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include "database.h"
+#include "database/database.h"
 
 // Extern declaration for btree_fp from btree.c
 extern FILE *btree_fp;

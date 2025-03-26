@@ -1,8 +1,8 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g
 
-SOURCES = main.c btree/btree.c database.c
-HEADERS = constants.h structs.h btree/btree.h database.h
+SOURCES = main.c btree/btree.c database/database.c
+HEADERS = constants.h structs.h btree/btree.h database/database.h
 OBJECTS = $(SOURCES:.c=.o)
 EXECUTABLE = database_program
 

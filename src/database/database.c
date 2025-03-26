@@ -1,8 +1,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "database.h"
-#include "btree/btree.h"
-#include "structs.h"
+#include "../btree/btree.h"
+#include "../structs.h"
 
 // Global file pointers
 FILE *metadata_fp, *data_fp;

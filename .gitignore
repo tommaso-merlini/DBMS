@@ -1,1 +1,3 @@
 /src/*.dat
+/src/*.o
+/src/database_program
