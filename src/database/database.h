@@ -2,31 +2,34 @@
 #define DATABASE_H
 
 #include <stdio.h>
-#include "../structs.h"
+#include "../structs.h" // Adjust path
 
 // --- Global Schema Storage ---
-// Make schema globally accessible or pass it around. Global for simplicity here.
 extern TableSchema database_schema[MAX_TABLES];
 extern int num_tables;
 
-// Initialization
-void init_database();
-void load_schema(); // New function to load schema from metadata.dat
+// --- Function Prototypes ---
 
-// Schema Lookup
+// Initialization & Cleanup
+int init_database(); // Return status (0 success, -1 error)
+void shutdown_database(); // Close files, free handles
+int load_schema(); // Return status
+
+// Schema Lookup (no change needed)
 TableSchema* find_table_schema(const char* table_name);
 const ColumnDefinition* find_column(const TableSchema* schema, const char* col_name);
 
-// Row Operations (Generic)
+// Row Operations (Take table name, data file path is in schema)
 long append_row_to_file(const TableSchema* schema, const void* row_data);
-void insert_row(const char* table_name, const void* row_data);
-void select_row(const char* table_name, int primary_key_value); // Still assumes int PK for lookup
+int insert_row(const char* table_name, const void* row_data); // Return status
+int select_row(const char* table_name, int primary_key_value); // Return status (0 found, 1 not found, -1 error)
 
-// Helper for printing a generic row
+// Helpers (no change needed)
 void print_row(const TableSchema* schema, const void* row_data);
-
-// Helper to get PK value (assuming int)
 int get_int_pk_value(const TableSchema* schema, const void* row_data);
 
+// Path Helper
+void build_path(char *dest, size_t dest_size, const char *part1, const char *part2, const char *part3);
 
-#endif
+
+#endif // DATABASE_H

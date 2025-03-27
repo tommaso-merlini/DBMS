@@ -2,6 +2,7 @@
 #define STRUCTS_H
 
 #include "constants.h"
+#include <stdio.h>
 #include <stdlib.h>
 
 // // Row structure for users table
@@ -26,13 +27,34 @@ typedef struct {
     int is_primary_key;
 } ColumnDefinition;
 
-// Table Schema Definition
+// Header structure for metadata
 typedef struct {
+    int magic;         // Magic number for file identification
+    int version;       // File format version
+    int node_size;     // Size of each node in bytes
+    int root_id;       // ID of the root node
+    int next_id;       // Next available node ID
+    // Add padding if needed to ensure consistent HEADER_SIZE
+    char padding[HEADER_SIZE - (5 * sizeof(int))];
+} BTreeHeader;
+
+// Structure to hold state for one B+ Tree instance
+typedef struct {
+    FILE *fp;               // File pointer for this specific index file
+    BTreeHeader header;     // Header info for this index file
+    char index_path[MAX_PATH_LEN]; // Path to the index file (for error messages)
+} BTreeHandle;
+
+// Table Schema Definition
+typedef struct TableSchema { // Give it a name for self-reference if needed
     char name[MAX_TABLE_NAME_LEN];
     ColumnDefinition columns[MAX_COLUMNS];
     int num_columns;
-    size_t row_size;        // Total size of a row in bytes
-    int pk_column_index; // Index of the primary key column in the columns array (-1 if none)
+    size_t row_size;
+    int pk_column_index;
+    BTreeHandle* pk_index; // Pointer to the handle for the primary key index
+    char table_dir[MAX_PATH_LEN]; // Directory path for this table
+    char data_path[MAX_PATH_LEN]; // Path to the data file
 } TableSchema;
 
 // Node structure for both leaf and internal nodes
@@ -44,15 +66,6 @@ typedef struct {
     int children[M];   // Child node IDs (used if not leaf)
     int next_leaf;     // ID of the next leaf node (used if leaf)
 } Node;
-
-// Header structure for metadata
-typedef struct {
-    int magic;         // Magic number for file identification
-    int version;       // File format version
-    int node_size;     // Size of each node in bytes
-    int root_id;       // ID of the root node
-    int next_id;       // Next available node ID
-} Header;
 
 // Structure to hold insertion result
 typedef struct {

@@ -1,21 +1,66 @@
 #include <stdio.h>
-#include <stdlib.h> // For malloc, free, atoi
+#include <stdlib.h>
 #include <string.h>
-#include <errno.h>  // For errno
+#include <errno.h>
+#include <sys/stat.h>   // For mkdir
+#include <sys/types.h> // For mkdir types
 #include "database.h"
-#include "../btree/btree.h"
-#include "../structs.h" // Includes constants.h
+#include "../btree/btree.h" // Include new btree prototypes
+#include "../constants.h"
+#include "../structs.h"
 
-// --- Global Variables ---
-FILE *metadata_fp, *data_fp; // Keep these if managing files here
-extern Header header; // From btree.c
-
-// Global Schema Storage
+// --- Global Schema Storage ---
 TableSchema database_schema[MAX_TABLES];
 int num_tables = 0;
 
-// --- Schema Management ---
+// --- Remove Global File Pointers ---
+// FILE *metadata_fp, *data_fp;
 
+// --- Path Helper ---
+void build_path(char *dest, size_t dest_size, const char *part1, const char *part2, const char *part3) {
+    if (!dest || dest_size == 0) return;
+    dest[0] = '\0'; // Start with empty string
+
+    if (part1) {
+        strncat(dest, part1, dest_size - strlen(dest) - 1);
+    }
+    if (part2) {
+        if (strlen(dest) > 0 && dest[strlen(dest)-1] != '/') {
+             strncat(dest, "/", dest_size - strlen(dest) - 1);
+        }
+        strncat(dest, part2, dest_size - strlen(dest) - 1);
+    }
+     if (part3) {
+        if (strlen(dest) > 0 && dest[strlen(dest)-1] != '/') {
+             strncat(dest, "/", dest_size - strlen(dest) - 1);
+        }
+        strncat(dest, part3, dest_size - strlen(dest) - 1);
+    }
+}
+
+// --- Directory Creation Helper ---
+int ensure_directory_exists(const char *path) {
+    struct stat st = {0};
+    if (stat(path, &st) == -1) {
+        // Directory doesn't exist, attempt to create it
+        #ifdef _WIN32
+            if (mkdir(path) != 0) {
+        #else
+            if (mkdir(path, 0775) != 0) { // Read/Write/Execute for owner/group, Read/Execute for others
+        #endif
+            fprintf(stderr, "Failed to create directory '%s': %s\n", path, strerror(errno));
+            return -1; // Failure
+        }
+        printf("Created directory: %s\n", path);
+    } else if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "Error: Path '%s' exists but is not a directory.\n", path);
+        return -1; // Failure - path exists but isn't a directory
+    }
+    return 0; // Success or directory already exists
+}
+
+
+// --- Schema Management (Modified load_schema) ---
 /**
  * @brief Finds a table schema by name.
  * @param table_name Name of the table.
@@ -46,252 +91,304 @@ const ColumnDefinition* find_column(const TableSchema* schema, const char* col_n
     return NULL;
 }
 
-
 /**
- * @brief Loads table schemas from the metadata file.
+ * Loads table schemas from the metadata file, initializes BTree handles.
+ * Return 0 on success, -1 on error.
  */
-void load_schema() {
-    metadata_fp = fopen("metadata.dat", "r");
-    if (!metadata_fp) {
-        perror("Error opening metadata.dat for reading");
-        // Attempt to create a default one? Or just exit?
-        // Let's try creating a default if it couldn't be read.
-        metadata_fp = fopen("metadata.dat", "w+");
-        if (!metadata_fp) {
-             perror("Failed to create metadata.dat");
-             exit(EXIT_FAILURE);
+/**
+ * Loads table schemas from the metadata file, initializes BTree handles.
+ * Creates a default metadata file if it doesn't exist.
+ * Return 0 on success, -1 on error.
+ */
+int load_schema() {
+    char metadata_path[MAX_PATH_LEN];
+    build_path(metadata_path, sizeof(metadata_path), DATA_DIR, METADATA_FILE, NULL);
+
+    FILE *meta_fp = fopen(metadata_path, "r");
+    if (!meta_fp) {
+        fprintf(stderr, "Metadata file '%s' not found. Creating default schema.\n", metadata_path);
+
+        // --- START: Create Default Metadata File ---
+        meta_fp = fopen(metadata_path, "w"); // Open for writing
+        if (!meta_fp) {
+             fprintf(stderr, "FATAL: Failed to create metadata file '%s': %s\n", metadata_path, strerror(errno));
+             num_tables = 0; // Ensure num_tables is 0 on failure
+             return -1; // Critical error
         }
-        fprintf(metadata_fp, "table:users\ncolumn:id:int:primary_key\ncolumn:name:string:%d\n", NAME_LEN);
-        fprintf(metadata_fp, "table:products\ncolumn:prod_id:int:primary_key\ncolumn:description:string:100\ncolumn:price:int\n"); // Example second table
-        rewind(metadata_fp); // Go back to the beginning to read what we just wrote
+
+        // Write default schema (e.g., users and products)
+        fprintf(meta_fp, "# Default database schema\n");
+        fprintf(meta_fp, "table:users\n");
+        fprintf(meta_fp, "column:id:int:primary_key\n");
+        fprintf(meta_fp, "column:name:string:%d\n", NAME_LEN); // Use constant if still defined, or hardcode like 50
+        fprintf(meta_fp, "\n"); // Add a newline for readability
+        fprintf(meta_fp, "table:products\n");
+        fprintf(meta_fp, "column:prod_id:int:primary_key\n");
+        fprintf(meta_fp, "column:description:string:100\n");
+        fprintf(meta_fp, "column:price:int\n");
+
+        fclose(meta_fp); // Close after writing
+
+        // Now, reopen the file for reading to continue loading
+        meta_fp = fopen(metadata_path, "r");
+        if (!meta_fp) {
+            // This should not happen if writing succeeded, but check anyway
+            fprintf(stderr, "FATAL: Failed to reopen metadata file '%s' for reading after creating it.\n", metadata_path);
+            num_tables = 0;
+            return -1;
+        }
+        printf("Created and reopened '%s' for reading.\n", metadata_path);
+        // --- END: Create Default Metadata File ---
     }
 
+    // --- Parsing Loop (Same as before, but will now run after default creation) ---
     char line[256];
     TableSchema* current_schema = NULL;
     size_t current_offset = 0;
-    num_tables = 0;
+    num_tables = 0; // Reset count before parsing
 
-    while (fgets(line, sizeof(line), metadata_fp)) {
-        // Remove trailing newline
+    while (fgets(line, sizeof(line), meta_fp)) {
         line[strcspn(line, "\r\n")] = 0;
-
-        // Skip empty lines or comments (optional)
-        if (strlen(line) == 0 || line[0] == '#') {
-            continue;
-        }
+        if (strlen(line) == 0 || line[0] == '#') continue;
 
         char* token;
         char* rest = line;
-
         token = strtok_r(rest, ":", &rest);
         if (!token) continue;
 
         if (strcmp(token, "table") == 0) {
-            if (num_tables >= MAX_TABLES) {
-                fprintf(stderr, "Error: Maximum number of tables (%d) reached.\n", MAX_TABLES);
-                break; // Stop parsing
-            }
-            current_schema = &database_schema[num_tables++];
-            memset(current_schema, 0, sizeof(TableSchema)); // Clear the schema struct
-            current_schema->pk_column_index = -1; // Initialize PK index
+            if (num_tables >= MAX_TABLES) { /* error handling */ break; }
+            current_schema = &database_schema[num_tables++]; // Increment num_tables HERE
+            memset(current_schema, 0, sizeof(TableSchema));
+            current_schema->pk_column_index = -1;
+            current_schema->pk_index = NULL;
 
             token = strtok_r(rest, ":", &rest); // Get table name
-            if (!token) {
-                 fprintf(stderr, "Error: Malformed 'table' line in metadata.dat\n");
-                 num_tables--; // Decrement count as this table is invalid
-                 current_schema = NULL;
-                 continue;
-            }
+            if (!token) { /* error handling */ num_tables--; current_schema=NULL; continue; }
+
             strncpy(current_schema->name, token, MAX_TABLE_NAME_LEN - 1);
             current_schema->name[MAX_TABLE_NAME_LEN - 1] = '\0';
             current_schema->num_columns = 0;
             current_schema->row_size = 0;
-            current_offset = 0; // Reset offset for the new table
-            printf("Loading schema for table: %s\n", current_schema->name);
+            current_offset = 0;
+
+            build_path(current_schema->table_dir, sizeof(current_schema->table_dir), DATA_DIR, current_schema->name, NULL);
+            if (ensure_directory_exists(current_schema->table_dir) != 0) {
+                 /* error handling */ num_tables--; current_schema = NULL; continue;
+            }
+            char data_filename[MAX_TABLE_NAME_LEN + sizeof(TABLE_DATA_EXT)];
+            snprintf(data_filename, sizeof(data_filename), "%s%s", current_schema->name, TABLE_DATA_EXT);
+            build_path(current_schema->data_path, sizeof(current_schema->data_path), current_schema->table_dir, data_filename, NULL);
+            printf("Loading schema for table: %s (Data: %s)\n", current_schema->name, current_schema->data_path);
 
         } else if (strcmp(token, "column") == 0) {
-            if (!current_schema) {
-                fprintf(stderr, "Error: 'column' definition found before 'table' in metadata.dat\n");
-                continue;
-            }
-            if (current_schema->num_columns >= MAX_COLUMNS) {
-                 fprintf(stderr, "Error: Maximum number of columns (%d) reached for table '%s'.\n", MAX_COLUMNS, current_schema->name);
-                 continue; // Skip this column
-            }
+             if (!current_schema) { /* error handling */ continue; }
+             if (current_schema->num_columns >= MAX_COLUMNS) { /* error handling */ continue; }
 
-            ColumnDefinition* col = &(current_schema->columns[current_schema->num_columns]);
-            memset(col, 0, sizeof(ColumnDefinition));
+             ColumnDefinition* col = &(current_schema->columns[current_schema->num_columns]); // Get address BEFORE incrementing num_columns
+             memset(col, 0, sizeof(ColumnDefinition));
 
-            // Parse column: name:type:size_or_flag:[flag]
-            char* col_name = strtok_r(rest, ":", &rest);
-            char* col_type = strtok_r(rest, ":", &rest);
-            char* col_arg = strtok_r(rest, ":", &rest); // Size or primary_key
-            char* col_flag = strtok_r(rest, ":", &rest); // Optional primary_key if size specified
+             char* col_name = strtok_r(rest, ":", &rest);
+             char* col_type = strtok_r(rest, ":", &rest);
+             char* col_arg = strtok_r(rest, ":", &rest);  // Might be NULL
+             char* col_flag = strtok_r(rest, ":", &rest); // Might be NULL
 
-            if (!col_name || !col_type || !col_arg) {
-                fprintf(stderr, "Error: Malformed 'column' line for table '%s'\n", current_schema->name);
-                continue;
-            }
+             // Only require name and type initially
+             if (!col_name || !col_type) {
+                 fprintf(stderr, "Error: Malformed 'column' line (missing name or type) for table '%s'\n", current_schema->name);
+                 continue;
+             }
 
-            // Column Name
-            strncpy(col->name, col_name, MAX_COLUMN_NAME_LEN - 1);
-            col->name[MAX_COLUMN_NAME_LEN - 1] = '\0';
-            col->offset = current_offset; // Set offset *before* calculating size
+             strncpy(col->name, col_name, MAX_COLUMN_NAME_LEN - 1);
+             col->name[MAX_COLUMN_NAME_LEN - 1] = '\0';
+             col->offset = current_offset; // Set offset before calculating size
 
-            // Column Type and Size
-            col->is_primary_key = 0; // Default
-            int is_pk = 0;
+             col->is_primary_key = 0;
+             int is_pk = 0;
 
-            if (strcmp(col_type, "int") == 0) {
-                col->type = COL_TYPE_INT;
-                col->size = sizeof(int);
-                if (col_arg && strcmp(col_arg, "primary_key") == 0) is_pk = 1;
-            } else if (strcmp(col_type, "string") == 0) {
-                col->type = COL_TYPE_STRING;
-                col->size = atoi(col_arg); // Size must be provided for string
-                if (col->size <= 0 || col->size > 1024*10) { // Add reasonable limits
-                    fprintf(stderr, "Warning: Invalid size %ld for string column '%s' in table '%s'. Defaulting to %d.\n", col->size, col->name, current_schema->name, NAME_LEN);
-                    col->size = NAME_LEN;
-                }
-                if (col_flag && strcmp(col_flag, "primary_key") == 0) is_pk = 1; // PK flag is optional 4th part for string
-            }
-            // Add other types here (e.g., float)
-            // else if (strcmp(col_type, "float") == 0) { ... }
-            else {
-                fprintf(stderr, "Error: Unknown column type '%s' for column '%s' in table '%s'\n", col_type, col->name, current_schema->name);
-                continue; // Skip this column
-            }
+             if (strcmp(col_type, "int") == 0) {
+                 col->type = COL_TYPE_INT;
+                 col->size = sizeof(int);
+                 // Check if col_arg exists and is "primary_key"
+                 if (col_arg && strcmp(col_arg, "primary_key") == 0) {
+                     is_pk = 1;
+                 }
+                 // Note: for 'int', col_flag is ignored currently
+             } else if (strcmp(col_type, "string") == 0) {
+                 col->type = COL_TYPE_STRING;
+                 // --- FIX: Check if col_arg exists for string size ---
+                 if (!col_arg) {
+                      fprintf(stderr, "Error: Missing size argument for string column '%s' in table '%s'\n", col_name, current_schema->name);
+                      continue; // Skip this invalid string column
+                 }
+                 // --- END FIX ---
+                 col->size = atoi(col_arg);
+                 if (col->size <= 0 || col->size > 1024*10) {
+                     fprintf(stderr, "Warning: Invalid size %d for string column '%s'. Using default %d.\n", (int)col->size, col_name, NAME_LEN);
+                     col->size = NAME_LEN;
+                 }
+                 // Check if col_flag exists and is "primary_key"
+                 if (col_flag && strcmp(col_flag, "primary_key") == 0) {
+                     is_pk = 1;
+                 }
+             } else {
+                  fprintf(stderr, "Error: Unknown column type '%s' for column '%s'\n", col_type, col_name);
+                  continue; // Skip unknown type
+             }
 
-            // Check for primary key
-            if (is_pk) {
+             // Primary Key check logic (remains the same)
+             if (is_pk) {
                 if (current_schema->pk_column_index != -1) {
-                    fprintf(stderr, "Error: Multiple primary keys defined for table '%s'. Ignoring PK flag for column '%s'.\n", current_schema->name, col->name);
-                } else if (col->type != COL_TYPE_INT) {
-                     fprintf(stderr, "Error: Primary key column '%s' in table '%s' is not of type INT. Current B+ Tree only supports INT keys. Ignoring PK flag.\n", col->name, current_schema->name);
-                } else {
-                    col->is_primary_key = 1;
-                    current_schema->pk_column_index = current_schema->num_columns;
-                }
-            }
+                     fprintf(stderr, "Warning: Multiple PKs for table '%s'. Ignoring PK for '%s'.\n", current_schema->name, col->name);
+                 } else if (col->type != COL_TYPE_INT) {
+                     fprintf(stderr, "Warning: PK '%s' in table '%s' is not INT. Indexing ignored.\n", col->name, current_schema->name);
+                 } else {
+                     col->is_primary_key = 1;
+                     current_schema->pk_column_index = current_schema->num_columns; // Use current index BEFORE increment
+                     printf("  -> Primary Key set to column: %s\n", col->name);
+                 }
+             }
 
-            // Update offsets and sizes
-            current_offset += col->size;
-            current_schema->row_size = current_offset; // Update total row size
-            current_schema->num_columns++;
-             printf("  -> Column: %s, Type: %d, Size: %zu, Offset: %zu, PK: %d\n", col->name, col->type, col->size, col->offset, col->is_primary_key);
-
+             // Increment counts and update sizes AFTER successful parsing
+             current_offset += col->size;
+             current_schema->row_size = current_offset;
+             current_schema->num_columns++; // Increment count HERE
+             printf("    Column: %s, Type: %d, Size: %zu, Offset: %zu, PK: %d\n", col->name, col->type, col->size, col->offset, col->is_primary_key);
         } else {
-            fprintf(stderr, "Warning: Unrecognized line type '%s' in metadata.dat\n", token);
+            fprintf(stderr, "Warning: Unrecognized line type '%s' in metadata.dbm\n", token);
         }
     }
+    fclose(meta_fp);
 
-    fclose(metadata_fp);
+    // --- Initialize B+ Tree (Same as before) ---
+    for (int i = 0; i < num_tables; ++i) {
+        TableSchema* schema = &database_schema[i];
+        if (schema->pk_column_index != -1) {
+            char index_filename[MAX_TABLE_NAME_LEN + 10];
+            snprintf(index_filename, sizeof(index_filename), "pk%s", PK_INDEX_EXT);
+            char index_path[MAX_PATH_LEN];
+            build_path(index_path, sizeof(index_path), schema->table_dir, index_filename, NULL);
 
-    // Final validation: Ensure every table has a primary key (as B+ Tree needs one)
-    for(int i=0; i < num_tables; ++i) {
-        if (database_schema[i].pk_column_index == -1) {
-             fprintf(stderr, "Error: Table '%s' does not have an INT primary_key defined. Indexing will not work correctly.\n", database_schema[i].name);
-             // Decide how to handle this - maybe remove the table? For now, just warn.
+            schema->pk_index = init_btree(index_path);
+            if (!schema->pk_index) {
+                fprintf(stderr, "FATAL: Failed to initialize primary key index for table '%s' at '%s'\n", schema->name, index_path);
+                // Cleanup already opened B-trees
+                for (int j = 0; j < i; ++j) {
+                    if(database_schema[j].pk_index) {
+                        close_btree(database_schema[j].pk_index);
+                        database_schema[j].pk_index = NULL;
+                    }
+                }
+                return -1;
+            }
+            printf("Initialized PK index for table '%s' at '%s'\n", schema->name, index_path);
+        } else {
+            /* warning */
         }
     }
 
     printf("Schema loading complete. %d table(s) loaded.\n", num_tables);
+    return 0; // Success
 }
 
-
-// --- Database Initialization ---
+// --- Database Initialization & Shutdown ---
 
 /**
- * Initialize the database files and load the schema.
+ * Initialize the database: Create data dir, load schema.
+ * Return 0 on success, -1 on failure.
  */
-void init_database() {
-    // Load schema first - it might create metadata.dat if it doesn't exist
-    load_schema();
+int init_database() {
+    printf("Initializing database in directory: %s\n", DATA_DIR);
 
-    // Data file - ensure it exists
-    data_fp = fopen("data.dat", "r+b");
-    if (!data_fp) {
-        data_fp = fopen("data.dat", "w+b");
-        if (!data_fp) {
-            perror("Failed to create data.dat");
-            exit(EXIT_FAILURE);
+    // Ensure the main data directory exists
+    if (ensure_directory_exists(DATA_DIR) != 0) {
+        return -1;
+    }
+
+    // Load schema (this will also create table dirs and init B-Trees)
+    if (load_schema() != 0) {
+        fprintf(stderr, "Database initialization failed during schema loading.\n");
+        // Perform partial cleanup maybe?
+        shutdown_database(); // Close any B-Trees that were opened
+        return -1;
+    }
+
+    // Check if data files exist (optional, could be created on first write)
+    for(int i=0; i < num_tables; ++i) {
+        FILE *fp_check = fopen(database_schema[i].data_path, "ab"); // Try opening in append mode
+        if(!fp_check) {
+             fprintf(stderr, "Warning: Could not open/create data file %s: %s\n", database_schema[i].data_path, strerror(errno));
+             // Decide if this is fatal
+        } else {
+            fclose(fp_check);
         }
     }
-    fclose(data_fp); // Close for now, reopen as needed
 
-    // B+ tree
-    init_btree(); // Assumes btree.dat setup
+    printf("Database initialization complete.\n");
+    return 0; // Success
 }
 
-// --- Row Operations (Generic) ---
+/**
+ * Shutdown the database: Close B-Tree files, free handles.
+ */
+void shutdown_database() {
+    printf("Shutting down database...\n");
+    for (int i = 0; i < num_tables; ++i) {
+        if (database_schema[i].pk_index) {
+            printf("Closing index for table '%s'\n", database_schema[i].name);
+            close_btree(database_schema[i].pk_index);
+            database_schema[i].pk_index = NULL; // Avoid double free
+        }
+    }
+    num_tables = 0; // Reset table count
+    printf("Database shutdown complete.\n");
+}
+
+
+// --- Row Operations (Using Schema Paths and BTree Handles) ---
 
 /**
- * Append a generic row buffer to the data file and return its offset.
- * @param schema Pointer to the table schema.
+ * Append a generic row buffer to the table's data file.
+ * @param schema Pointer to the table schema (contains data_path).
  * @param row_data Pointer to the raw row data buffer.
  * @return Offset where the row is written, or -1 on error.
  */
 long append_row_to_file(const TableSchema* schema, const void* row_data) {
-    if (!schema || !row_data) {
-        fprintf(stderr, "Error: Cannot append row with NULL schema or data.\n");
-        return -1;
-    }
+    if (!schema || !row_data) return -1;
 
-    data_fp = fopen("data.dat", "r+b"); // Use "ab" for append-only binary? "r+b" allows seeking later maybe
+    FILE *data_fp = fopen(schema->data_path, "ab"); // Open in append binary mode
     if (!data_fp) {
-        perror("Error opening data.dat for appending");
+        fprintf(stderr, "Error opening data file '%s' for appending: %s\n", schema->data_path, strerror(errno));
         return -1;
     }
 
-    // Seek to end isn't strictly necessary with "ab", but good practice with "r+b"
-    if (fseek(data_fp, 0, SEEK_END) != 0) {
-         perror("Error seeking to end of data.dat");
-         fclose(data_fp);
-         return -1;
-    }
-
+    // We are in append mode, ftell gives current end-of-file position *before* write
     long offset = ftell(data_fp);
     if (offset == -1) {
-        perror("Error getting file position in data.dat");
+        perror("Error getting file position");
         fclose(data_fp);
         return -1;
     }
 
     size_t written = fwrite(row_data, schema->row_size, 1, data_fp);
-    fflush(data_fp); // Ensure data is written to disk
+    // fflush(data_fp); // Append mode often buffers less aggressively, but fflush ensures it
     fclose(data_fp);
 
     if (written != 1) {
-        fprintf(stderr, "Error writing row data to data.dat (expected %zu bytes)\n", schema->row_size);
-        // Should we attempt to truncate the file back? Complex.
+        fprintf(stderr, "Error writing row data to '%s' (expected %zu bytes)\n", schema->data_path, schema->row_size);
+        // Difficult to recover cleanly here. Offset is likely useless now.
         return -1;
     }
 
     return offset;
 }
 
-/**
- * Extracts the integer primary key value from a raw row buffer.
- * @param schema Pointer to the table schema.
- * @param row_data Pointer to the raw row data buffer.
- * @return The integer primary key value.
- * @note Exits fatally if PK is not found, not int, or data is NULL.
- */
 int get_int_pk_value(const TableSchema* schema, const void* row_data) {
-     if (!schema || !row_data) {
-        fprintf(stderr, "FATAL: Cannot get PK value from NULL schema or data.\n");
-        exit(EXIT_FAILURE);
-    }
-     if (schema->pk_column_index < 0 || schema->pk_column_index >= schema->num_columns) {
-        fprintf(stderr, "FATAL: Table '%s' has no valid primary key index defined.\n", schema->name);
-        exit(EXIT_FAILURE);
-     }
+    // ... (no changes needed, but ensure fatal errors are handled if desired)
+     if (!schema || !row_data) { exit(EXIT_FAILURE); } // Example fatal exit
+     if (schema->pk_column_index < 0) { exit(EXIT_FAILURE); }
      const ColumnDefinition* pk_col = &schema->columns[schema->pk_column_index];
-     if (pk_col->type != COL_TYPE_INT) {
-         fprintf(stderr, "FATAL: Primary key '%s' for table '%s' is not type INT.\n", pk_col->name, schema->name);
-         exit(EXIT_FAILURE);
-     }
-     // Calculate address of PK field within the buffer and cast to int*
+     if (pk_col->type != COL_TYPE_INT) { exit(EXIT_FAILURE); }
      int pk_value;
      memcpy(&pk_value, (const char*)row_data + pk_col->offset, sizeof(int));
      return pk_value;
@@ -301,110 +398,101 @@ int get_int_pk_value(const TableSchema* schema, const void* row_data) {
  * Insert a generic row into the database.
  * @param table_name Name of the table to insert into.
  * @param row_data Pointer to the raw row data buffer.
+ * @return 0 on success, -1 on error, 1 for duplicate key.
  */
-void insert_row(const char* table_name, const void* row_data) {
+int insert_row(const char* table_name, const void* row_data) {
     TableSchema* schema = find_table_schema(table_name);
     if (!schema) {
-        fprintf(stderr, "Error: Table '%s' not found.\n", table_name);
-        return;
+        fprintf(stderr, "Error: Table '%s' not found for insert.\n", table_name);
+        return -1;
     }
-     if (schema->pk_column_index == -1) {
-         fprintf(stderr, "Error: Cannot insert into table '%s' without an INT primary key.\n", table_name);
-         return;
+    if (!schema->pk_index) { // Check if BTree handle exists
+         fprintf(stderr, "Error: Cannot insert into table '%s' without a valid primary key index.\n", table_name);
+         return -1;
      }
 
-    // Extract primary key (must be int for current B+ Tree)
+    // Extract primary key (must be int)
     int pk_value = get_int_pk_value(schema, row_data);
 
-    // Check for duplicates using B+ Tree
-    long existing_offset = search(pk_value, header.root_id); // search is from btree.c
+    // Check for duplicates using the table's specific B+ Tree
+    long existing_offset = search(schema->pk_index, pk_value); // Use handle
     if (existing_offset != -1) {
         fprintf(stderr, "Error: Duplicate primary key value %d in table '%s'.\n", pk_value, table_name);
-        return;
+        return 1; // Indicate duplicate key
     }
 
-    // Append row data to data file
+    // Append row data to the table's data file
     long offset = append_row_to_file(schema, row_data);
     if (offset == -1) {
         fprintf(stderr, "Error: Failed to append row data for table '%s'.\n", table_name);
-        return; // Don't insert into index if data write failed
+        return -1; // Data write failed
     }
 
-    // Insert key (PK value) and offset into B+ Tree
-    btree_insert(pk_value, offset); // btree_insert is from btree.c
+    // Insert key (PK value) and offset into the table's B+ Tree
+    btree_insert(schema->pk_index, pk_value, offset); // Use handle
 
-    printf("Inserted into %s: PK=%d at offset=%ld\n", table_name, pk_value, offset);
+    printf("Inserted into %s: PK=%d at offset=%ld (Data: %s, Index: %s)\n",
+           table_name, pk_value, offset, schema->data_path, schema->pk_index->index_path);
+    return 0; // Success
 }
 
 /**
  * Select and display a row by its primary key value.
  * @param table_name Name of the table.
  * @param primary_key_value The integer primary key value to find.
+ * @return 0 if found, 1 if not found, -1 on error.
  */
-void select_row(const char* table_name, int primary_key_value) {
+int select_row(const char* table_name, int primary_key_value) {
     TableSchema* schema = find_table_schema(table_name);
     if (!schema) {
-        fprintf(stderr, "Error: Table '%s' not found.\n", table_name);
-        return;
+        fprintf(stderr, "Error: Table '%s' not found for select.\n", table_name);
+        return -1;
     }
-     if (schema->pk_column_index == -1) {
-         fprintf(stderr, "Error: Cannot select from table '%s' without an INT primary key.\n", table_name);
-         return;
+     if (!schema->pk_index) {
+         fprintf(stderr, "Error: Cannot select from table '%s' without a valid primary key index.\n", table_name);
+         return -1;
      }
 
-    // Search B+ Tree for the offset
-    long offset = search(primary_key_value, header.root_id);
+    // Search the table's B+ Tree for the offset
+    long offset = search(schema->pk_index, primary_key_value); // Use handle
     if (offset == -1) {
         printf("Record with PK %d not found in table '%s'\n", primary_key_value, table_name);
-        return;
+        return 1; // Not found
     }
 
-    // Open data file and seek to the offset
-    data_fp = fopen("data.dat", "rb");
+    // Open the table's data file and seek to the offset
+    FILE *data_fp = fopen(schema->data_path, "rb");
     if (!data_fp) {
-        perror("Error opening data.dat for reading");
-        return;
+        fprintf(stderr, "Error opening data file '%s' for reading: %s\n", schema->data_path, strerror(errno));
+        return -1;
     }
 
     if (fseek(data_fp, offset, SEEK_SET) != 0) {
-        perror("Error seeking in data.dat");
+        fprintf(stderr, "Error seeking to offset %ld in '%s': %s\n", offset, schema->data_path, strerror(errno));
         fclose(data_fp);
-        return;
+        return -1;
     }
 
-    // Allocate buffer to read the row data
+    // Allocate buffer and read the row data
     void* row_data = malloc(schema->row_size);
-    if (!row_data) {
-        fprintf(stderr, "Error: Failed to allocate memory (%zu bytes) for row buffer.\n", schema->row_size);
-        fclose(data_fp);
-        return;
-    }
+    if (!row_data) { /* ... error handling ... */ fclose(data_fp); return -1; }
 
-    // Read the row data
     size_t read_count = fread(row_data, schema->row_size, 1, data_fp);
     fclose(data_fp);
 
     if (read_count != 1) {
-        // Check for EOF vs other errors
-        if (feof(data_fp)) {
-             fprintf(stderr, "Error: Unexpected end of file while reading row at offset %ld (expected %zu bytes).\n", offset, schema->row_size);
-        } else if(ferror(data_fp)) {
-            perror("Error reading row data from data.dat");
-        } else {
-             fprintf(stderr, "Error: Failed to read row at offset %ld (read_count=%zu, expected 1 of size %zu).\n", offset, read_count, schema->row_size);
-        }
+        fprintf(stderr, "Error reading row at offset %ld from '%s'. Expected %zu bytes.\n", offset, schema->data_path, schema->row_size);
         free(row_data);
-        return;
+        return -1;
     }
 
-    // Print the found row using the generic print function
-    printf("Found in %s (PK=%d):\n", table_name, primary_key_value);
+    // Print the found row
+    printf("Found in %s (PK=%d, Offset=%ld):\n", table_name, primary_key_value, offset);
     print_row(schema, row_data);
 
-    // Clean up
     free(row_data);
+    return 0; // Found
 }
-
 
 /**
  * @brief Prints the content of a generic row buffer based on its schema.
@@ -453,6 +541,3 @@ void print_row(const TableSchema* schema, const void* row_data) {
     }
     printf("  }\n");
 }
-
-// --- B+ Tree code (btree.c) remains unchanged for now ---
-// It still uses int keys and assumes the PK passed to it is int.
