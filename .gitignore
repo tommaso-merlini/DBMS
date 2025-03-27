@@ -1,6 +1,6 @@
 /src/*.dat
 /src/*.o
 /src/database_program
-/bin/*
-/build/*
-/db_data/*
+/bin
+/build
+/db_data
