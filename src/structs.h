@@ -2,12 +2,38 @@
 #define STRUCTS_H
 
 #include "constants.h"
+#include <stdlib.h>
 
-// Row structure for users table
+// // Row structure for users table
+// typedef struct {
+//     int id;
+//     char name[NAME_LEN];
+// } Row;
+
+// Supported Column Types
+typedef enum {
+    COL_TYPE_INT,
+    COL_TYPE_STRING
+    // Add more types here (FLOAT, DATE, etc.)
+} ColumnType;
+
+// Column Definition
 typedef struct {
-    int id;
-    char name[NAME_LEN];
-} Row;
+    char name[MAX_COLUMN_NAME_LEN];
+    ColumnType type;
+    size_t size;       // Size in bytes (e.g., sizeof(int), or string buffer length)
+    size_t offset;     // Offset within the row buffer
+    int is_primary_key;
+} ColumnDefinition;
+
+// Table Schema Definition
+typedef struct {
+    char name[MAX_TABLE_NAME_LEN];
+    ColumnDefinition columns[MAX_COLUMNS];
+    int num_columns;
+    size_t row_size;        // Total size of a row in bytes
+    int pk_column_index; // Index of the primary key column in the columns array (-1 if none)
+} TableSchema;
 
 // Node structure for both leaf and internal nodes
 typedef struct {
