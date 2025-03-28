@@ -19,6 +19,8 @@ int load_schema(); // Return status
 TableSchema* find_table_schema(const char* table_name);
 const ColumnDefinition* find_column(const TableSchema* schema, const char* col_name);
 
+int select_scan(const char* table_name, const char* filter_col_name, const char* filter_val_str);
+
 // Row Operations (Take table name, data file path is in schema)
 long append_row_to_file(const TableSchema* schema, const void* row_data);
 int insert_row(const char* table_name, const void* row_data); // Return status

@@ -216,12 +216,10 @@ int load_schema() {
                  // Note: for 'int', col_flag is ignored currently
              } else if (strcmp(col_type, "string") == 0) {
                  col->type = COL_TYPE_STRING;
-                 // --- FIX: Check if col_arg exists for string size ---
                  if (!col_arg) {
                       fprintf(stderr, "Error: Missing size argument for string column '%s' in table '%s'\n", col_name, current_schema->name);
                       continue; // Skip this invalid string column
                  }
-                 // --- END FIX ---
                  col->size = atoi(col_arg);
                  if (col->size <= 0 || col->size > 1024*10) {
                      fprintf(stderr, "Warning: Invalid size %d for string column '%s'. Using default %d.\n", (int)col->size, col_name, NAME_LEN);
@@ -475,7 +473,10 @@ int select_row(const char* table_name, int primary_key_value) {
 
     // Allocate buffer and read the row data
     void* row_data = malloc(schema->row_size);
-    if (!row_data) { /* ... error handling ... */ fclose(data_fp); return -1; }
+    if (!row_data) { 
+        // TODO:  error handling ...
+        fclose(data_fp); return -1; 
+    }
 
     size_t read_count = fread(row_data, schema->row_size, 1, data_fp);
     fclose(data_fp);
@@ -492,6 +493,167 @@ int select_row(const char* table_name, int primary_key_value) {
 
     free(row_data);
     return 0; // Found
+}
+
+/**
+ * @brief Compares a filter value string with data in a buffer based on column definition.
+ * @param col The column definition.
+ * @param field_ptr Pointer to the start of the field data within the row buffer.
+ * @param filter_val_str The filter value as a string from the query.
+ * @return 1 if match, 0 if no match, -1 on error (e.g., bad filter value type).
+ */
+int compare_value(const ColumnDefinition* col, const void* field_ptr, const char* filter_val_str) {
+    if (!col || !field_ptr || !filter_val_str) return -1;
+
+    if (col->type == COL_TYPE_INT) {
+        int stored_value;
+        memcpy(&stored_value, field_ptr, sizeof(int));
+
+        // Convert filter string to int
+        char *endptr;
+        errno = 0;
+        long filter_val_long = strtol(filter_val_str, &endptr, 10);
+        // Check conversion errors
+        if (endptr == filter_val_str || *endptr != '\0' || errno == ERANGE || (errno != 0 && filter_val_long == 0)) {
+            fprintf(stderr, "Error: Invalid integer filter value '%s' for column '%s'.\n", filter_val_str, col->name);
+            return -1; // Indicate error
+        }
+        int filter_value = (int)filter_val_long; // Assume fits in int
+
+        return (stored_value == filter_value); // Return 1 if match, 0 if not
+
+    } else if (col->type == COL_TYPE_STRING) {
+        // Compare strings carefully, up to the defined size.
+        // The stored string might not be null-terminated if it fills the space.
+        // The filter string *is* null-terminated.
+
+        // Use strncmp for safety. Compare up to col->size bytes.
+        // We need to check if the filter string *exactly matches* the potentially
+        // non-null-terminated stored string within its boundary.
+
+        int result = strncmp((const char*)field_ptr, filter_val_str, col->size);
+
+        if (result == 0) {
+            // First col->size bytes match. Now check if filter string is *also*
+            // exactly col->size long OR if the stored string has a null terminator
+            // right after the matched part.
+            size_t filter_len = strlen(filter_val_str);
+            if (filter_len == col->size) {
+                // Filter string fills the buffer exactly, matches.
+                return 1;
+            } else if (filter_len < col->size) {
+                // Filter string is shorter. Check if the stored data has a
+                // null terminator or padding right after the filter length.
+                return (((const char*)field_ptr)[filter_len] == '\0');
+            } else {
+                // Filter string is longer than the column size, cannot match exactly.
+                return 0;
+            }
+        } else {
+            // Initial strncmp failed.
+            return 0;
+        }
+
+    } else {
+        fprintf(stderr, "Error: Comparison not implemented for this column type.\n");
+        return -1; // Error for unsupported type
+    }
+}
+
+
+/**
+ * @brief Performs a full table scan to find rows matching a filter condition.
+ * Currently only supports equality check ('=').
+ * @param table_name Name of the table to scan.
+ * @param filter_col_name Name of the column to filter on.
+ * @param filter_val_str The value to filter for (as a string).
+ * @return Number of matching rows found, or -1 on error.
+ */
+int select_scan(const char* table_name, const char* filter_col_name, const char* filter_val_str) {
+    printf("Executing Full Table Scan on %s WHERE %s = '%s'\n", table_name, filter_col_name, filter_val_str);
+
+    // 1. Find Schema and Column Definition
+    TableSchema* schema = find_table_schema(table_name);
+    if (!schema) {
+        fprintf(stderr, "Error: Table '%s' not found for scan.\n", table_name);
+        return -1;
+    }
+    const ColumnDefinition* filter_col = find_column(schema, filter_col_name);
+    if (!filter_col) {
+        fprintf(stderr, "Error: Column '%s' not found in table '%s'.\n", filter_col_name, table_name);
+        return -1;
+    }
+
+    // 2. Open Data File
+    FILE *data_fp = fopen(schema->data_path, "rb");
+    if (!data_fp) {
+        fprintf(stderr, "Error opening data file '%s' for scanning: %s\n", schema->data_path, strerror(errno));
+        return -1;
+    }
+
+    // 3. Allocate Row Buffer
+    void* row_data = malloc(schema->row_size);
+    if (!row_data) {
+        perror("Error allocating memory for row buffer during scan");
+        fclose(data_fp);
+        return -1;
+    }
+
+    // 4. Scan Loop
+    int found_count = 0;
+    long current_offset = 0; // Keep track for potential debugging info
+    size_t rows_read = 0;
+
+    while (1) {
+        // Read one row
+        size_t read_count = fread(row_data, schema->row_size, 1, data_fp);
+
+        if (read_count == 1) {
+            rows_read++;
+            // Get pointer to the specific field within the row buffer
+            const void* field_ptr = (const char*)row_data + filter_col->offset;
+
+            // Compare the value
+            int match_result = compare_value(filter_col, field_ptr, filter_val_str);
+
+            if (match_result == 1) {
+                // Match found! Print the row.
+                printf("Found Match at Offset ~%ld:\n", current_offset); // Offset is approximate start
+                print_row(schema, row_data);
+                found_count++;
+            } else if (match_result == -1) {
+                 // Error during comparison (e.g., bad filter value format)
+                 fprintf(stderr, "Scan aborted due to comparison error.\n");
+                 found_count = -1; // Signal error
+                 break; // Stop scanning
+            }
+            // If match_result == 0, continue to next row
+
+            current_offset += schema->row_size; // Update approximate offset
+
+        } else {
+            // fread returned 0 or less than 1
+            if (feof(data_fp)) {
+                // End Of File reached normally
+                break;
+            } else if (ferror(data_fp)) {
+                // Actual read error occurred
+                perror("Error reading from data file during scan");
+                found_count = -1; // Signal error
+                break;
+            } else {
+                // Short read (unexpected EOF?) - treat as error/end
+                 fprintf(stderr, "Warning: Unexpected end of data file or short read after %zu rows.\n", rows_read);
+                 break;
+            }
+        }
+    } // End while loop
+
+    // 5. Cleanup
+    free(row_data);
+    fclose(data_fp);
+
+    return found_count; // Return number of matches found (or -1 on error)
 }
 
 /**
