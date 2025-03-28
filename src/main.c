@@ -297,49 +297,40 @@ syntax_error:
     fprintf(stderr, "Expected: INSERT INTO table VALUES (val1, val2, ...);\n");
 }
 
-// Handle SELECT * FROM table WHERE pk_col = value;
 void handle_select(char* original_input) {
     char input_copy[MAX_INPUT_LEN];
     strncpy(input_copy, original_input, MAX_INPUT_LEN - 1);
     input_copy[MAX_INPUT_LEN - 1] = '\0';
 
+    // --- Parsing (same as previous correct version) ---
     char *token;
     char *table_name = NULL;
     char *where_col = NULL;
     char *where_val_str = NULL;
 
-    // 1. SELECT
-    token = strtok(input_copy, " \t\n");
+    token = strtok(input_copy, " \t\n"); // SELECT
     if (!token || strcasecmp(token, "SELECT") != 0) goto syntax_error;
-
-    // 2. *
-    token = strtok(NULL, " \t\n");
+    token = strtok(NULL, " \t\n"); // *
     if (!token || strcmp(token, "*") != 0) goto syntax_error;
-
-    // 3. FROM
-    token = strtok(NULL, " \t\n");
+    token = strtok(NULL, " \t\n"); // FROM
     if (!token || strcasecmp(token, "FROM") != 0) goto syntax_error;
-
-    // 4. table_name
-    table_name = strtok(NULL, " \t\n");
+    table_name = strtok(NULL, " \t\n"); // table_name
     if (!table_name) goto syntax_error;
-
-    // 5. WHERE
-    token = strtok(NULL, " \t\n");
+    token = strtok(NULL, " \t\n"); // WHERE
     if (!token || strcasecmp(token, "WHERE") != 0) goto syntax_error;
 
-    // 6. where_col
-    where_col = strtok(NULL, " \t\n=");
+    where_col = strtok(NULL, " \t\n="); // id
     if (!where_col) goto syntax_error;
+    size_t len = strlen(where_col);
+    if (len > 0 && where_col[len - 1] == '=') where_col[len - 1] = '\0';
     where_col = trim_whitespace(where_col);
 
-    // 7. Get value after '='
-    token = strtok(NULL, " \t\n");
+    token = strtok(NULL, " \t\n"); // Should be '=' or part of '=value'
     if (!token) goto syntax_error;
     if (strcmp(token, "=") != 0) {
         if (token[0] == '=') {
-            where_val_str = token + 1;
-            if (strlen(where_val_str) == 0) goto syntax_error;
+             where_val_str = token + 1;
+             if (strlen(where_val_str) == 0) goto syntax_error;
         } else { goto syntax_error; }
     } else {
         where_val_str = strtok(NULL, " \t\n");
@@ -347,69 +338,56 @@ void handle_select(char* original_input) {
     }
     where_val_str = trim_whitespace(where_val_str);
     if (strlen(where_val_str) == 0) goto syntax_error;
+    // --- End Parsing ---
 
 
-    // --- Execution Logic ---
-
-    // 8. Find table schema
+    // --- Schema and PK Validation (same as before) ---
     TableSchema* schema = find_table_schema(table_name);
-    if (!schema) {
-        fprintf(stderr, "Error: Table '%s' not found.\n", table_name);
-        return;
-    }
+    if (!schema) { fprintf(stderr, "Error: Table '%s' not found.\n", table_name); return; }
+    if (schema->pk_column_index == -1) { fprintf(stderr, "Error: Table '%s' lacks primary key for WHERE.\n", table_name); return; }
+    const ColumnDefinition* pk_col_def = &schema->columns[schema->pk_column_index];
+    if (strcmp(where_col, pk_col_def->name) != 0) { fprintf(stderr, "Error: WHERE clause must use PK ('%s').\n", pk_col_def->name); return; }
+    if (pk_col_def->type != COL_TYPE_INT) { fprintf(stderr, "Error: WHERE clause only supports INT PK.\n"); return; }
+    // --- End Validation ---
 
-    // 9. Find the filter column definition
-    const ColumnDefinition* filter_col = find_column(schema, where_col);
-    if (!filter_col) {
-         fprintf(stderr, "Error: Column '%s' not found in table '%s'.\n", where_col, table_name);
-         return;
-    }
+    // --- Convert PK Value (same as before) ---
+    char *endptr; errno = 0; long pk_val_long = strtol(where_val_str, &endptr, 10);
+    if (endptr == where_val_str || *endptr != '\0' || errno == ERANGE || (errno!=0 && pk_val_long==0)) { fprintf(stderr, "Error: Invalid integer '%s'.\n", where_val_str); return; }
+    if (pk_val_long > INT_MAX || pk_val_long < INT_MIN) { fprintf(stderr, "Error: Integer '%s' out of range.\n", where_val_str); return; }
+    int pk_val = (int)pk_val_long;
+    // --- End Convert PK Value ---
 
-    // 10. Decide: Use Index (PK) or Scan?
-    int result = -2; // Initialize result status
 
-    // Check if the filter column is the INT Primary Key
-    if (filter_col->is_primary_key && filter_col->type == COL_TYPE_INT) {
-        // --- Use Primary Key Index Lookup ---
-        printf("Using primary key index for lookup...\n");
-        char *endptr;
-        errno = 0;
-        long pk_val_long = strtol(where_val_str, &endptr, 10);
-        if (endptr == where_val_str || *endptr != '\0' || errno == ERANGE || (errno != 0 && pk_val_long == 0)) {
-             fprintf(stderr, "Error: Invalid integer value '%s' for primary key lookup.\n", where_val_str);
-             return; // Error before calling select_row
-        }
-        if (pk_val_long > INT_MAX || pk_val_long < INT_MIN) { /* error range */ return; }
-        int pk_val = (int)pk_val_long;
+    // --- Execute select_row and handle returned data ---
+    printf("Executing: SELECT * FROM %s WHERE %s = %d\n", table_name, pk_col_def->name, pk_val);
 
-        // Call the original select_row function (assumed to use index)
-        result = select_row(table_name, pk_val); // Returns 0 found, 1 not found, -1 error
+    void* found_row_data = NULL; // Pointer to hold the data buffer
+    int result = select_row(table_name, pk_val, &found_row_data); // Call the modified function
 
-        if (result == 0) printf("1 row found (via index).\n");
-        else if (result == 1) printf("0 rows found (via index).\n");
-        else printf("Index lookup failed (error code %d).\n", result);
-
-    } else {
-        // --- Use Full Table Scan ---
-        // Check if column type is supported for scanning/comparison
-        if (filter_col->type != COL_TYPE_INT && filter_col->type != COL_TYPE_STRING) {
-             fprintf(stderr, "Error: Filtering by column '%s' with this data type is not supported yet.\n", where_col);
-             return;
-        }
-
-        result = select_scan(table_name, where_col, where_val_str); // Returns count or -1
-
-        if (result >= 0) {
-             printf("%d row(s) found (via full scan).\n", result);
+    if (result == 0) { // Found
+        // Check if data was actually returned (should always be true if result is 0)
+        if (found_row_data) {
+            printf("--- Row Found ---\n");
+            // Process the data - here we just print it
+            print_row(schema, found_row_data);
+            // CRITICAL: Free the memory allocated by select_row
+            free(found_row_data);
+            printf("---------------\n1 row found.\n");
         } else {
-             printf("Table scan failed.\n"); // Error messages printed inside select_scan
+            // This case indicates an internal logic error in select_row
+            fprintf(stderr, "Internal Error: select_row returned success (0) but output data pointer is NULL.\n");
         }
+    } else if (result == 1) { // Not Found
+         printf("Record with PK %d not found in table '%s'.\n", pk_val, table_name); // Print message here now
+         printf("0 rows found.\n");
+    } else { // Error (-1)
+         // Error messages should have been printed inside select_row or its callees
+         printf("Select failed (error code %d).\n", result);
     }
-
-    return; // Finished handling select
+    return; // Done with this command
 
 syntax_error:
-    fprintf(stderr, "Syntax error parsing SELECT statement. Expected: SELECT * FROM table WHERE column = value;\n");
+    fprintf(stderr, "Syntax error parsing SELECT statement. Expected: SELECT * FROM table WHERE pk_col = value;\n");
 }
 
 // --- Main Loop ---

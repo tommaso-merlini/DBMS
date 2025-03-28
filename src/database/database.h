@@ -24,7 +24,7 @@ int select_scan(const char* table_name, const char* filter_col_name, const char*
 // Row Operations (Take table name, data file path is in schema)
 long append_row_to_file(const TableSchema* schema, const void* row_data);
 int insert_row(const char* table_name, const void* row_data); // Return status
-int select_row(const char* table_name, int primary_key_value); // Return status (0 found, 1 not found, -1 error)
+int select_row(const char* table_name, int primary_key_value, void** row_data_out);
 
 // Helpers (no change needed)
 void print_row(const TableSchema* schema, const void* row_data);

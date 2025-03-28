@@ -435,63 +435,72 @@ int insert_row(const char* table_name, const void* row_data) {
 }
 
 /**
- * Select and display a row by its primary key value.
- * @param table_name Name of the table.
- * @param primary_key_value The integer primary key value to find.
- * @return 0 if found, 1 if not found, -1 on error.
+ * Selects a row by primary key value and returns its raw data via output parameter.
+ * Caller is responsible for freeing the returned buffer (*row_data_out).
  */
-int select_row(const char* table_name, int primary_key_value) {
+int select_row(const char* table_name, int primary_key_value, void** row_data_out) {
+    // Validate output parameter pointer
+    if (!row_data_out) {
+        fprintf(stderr, "Error: Output parameter row_data_out cannot be NULL.\n");
+        return -1;
+    }
+    *row_data_out = NULL; // Initialize output to NULL
+
+    // Find schema
     TableSchema* schema = find_table_schema(table_name);
     if (!schema) {
         fprintf(stderr, "Error: Table '%s' not found for select.\n", table_name);
         return -1;
     }
-     if (!schema->pk_index) {
-         fprintf(stderr, "Error: Cannot select from table '%s' without a valid primary key index.\n", table_name);
-         return -1;
-     }
-
-    // Search the table's B+ Tree for the offset
-    long offset = search(schema->pk_index, primary_key_value); // Use handle
-    if (offset == -1) {
-        printf("Record with PK %d not found in table '%s'\n", primary_key_value, table_name);
-        return 1; // Not found
-    }
-
-    // Open the table's data file and seek to the offset
-    FILE *data_fp = fopen(schema->data_path, "rb");
-    if (!data_fp) {
-        fprintf(stderr, "Error opening data file '%s' for reading: %s\n", schema->data_path, strerror(errno));
+    if (!schema->pk_index) {
+        fprintf(stderr, "Error: Cannot select from table '%s' without a valid primary key index.\n", table_name);
         return -1;
     }
 
+    // Search the table's B+ Tree for the offset
+    long offset = search(schema->pk_index, primary_key_value);
+    if (offset == -1) {
+        // This is not an error, just not found
+        // printf("Record with PK %d not found in table '%s'\n", primary_key_value, table_name); // Keep message? Optional.
+        return 1; // Not found
+    }
+
+    // Open the table's data file
+    FILE *data_fp = fopen(schema->data_path, "rb");
+    if (!data_fp) {
+        fprintf(stderr, "Error opening data file '%s' for reading: %s\n", schema->data_path, strerror(errno));
+        return -1; // Error
+    }
+
+    // Seek to the offset
     if (fseek(data_fp, offset, SEEK_SET) != 0) {
         fprintf(stderr, "Error seeking to offset %ld in '%s': %s\n", offset, schema->data_path, strerror(errno));
+        fclose(data_fp);
+        return -1; // Error
+    }
+
+    // Allocate buffer to hold the row data
+    // NOTE: This memory must be freed by the CALLER on success!
+    void* row_data_buffer = malloc(schema->row_size);
+    if (!row_data_buffer) {
+        perror("Error allocating memory for row buffer");
         fclose(data_fp);
         return -1;
     }
 
-    // Allocate buffer and read the row data
-    void* row_data = malloc(schema->row_size);
-    if (!row_data) { 
-        // TODO:  error handling ...
-        fclose(data_fp); return -1; 
-    }
-
-    size_t read_count = fread(row_data, schema->row_size, 1, data_fp);
-    fclose(data_fp);
+    // Read the row data into the buffer
+    size_t read_count = fread(row_data_buffer, schema->row_size, 1, data_fp);
+    fclose(data_fp); // Close file now that reading is done
 
     if (read_count != 1) {
-        fprintf(stderr, "Error reading row at offset %ld from '%s'. Expected %zu bytes.\n", offset, schema->data_path, schema->row_size);
-        free(row_data);
+        fprintf(stderr, "Error reading row at offset %ld from '%s'. Expected %zu bytes, read count %zu.\n",
+                offset, schema->data_path, schema->row_size, read_count);
+        free(row_data_buffer);
         return -1;
     }
 
-    // Print the found row
-    printf("Found in %s (PK=%d, Offset=%ld):\n", table_name, primary_key_value, offset);
-    print_row(schema, row_data);
+    *row_data_out = row_data_buffer;
 
-    free(row_data);
     return 0; // Found
 }
 
